@@ -18,10 +18,12 @@
 package com.github.ehiggs.spark.terasort
 
 import com.google.common.primitives.UnsignedBytes
+import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.{HashPartitioner, Partitioner, SparkConf, SparkContext, TaskContext}
 
 import java.util.Comparator
+import scala.util.Random
 
 /**
  * This is a great example program to stress test Spark's shuffle mechanism.
@@ -30,8 +32,16 @@ import java.util.Comparator
  */
 object TeraSortComp {
 
-  implicit val caseInsensitiveOrdering : Comparator[Array[Byte]] =
+  implicit val caseInsensitiveOrdering: Comparator[Array[Byte]] =
     UnsignedBytes.lexicographicalComparator
+
+  def makeDataset(sc: SparkContext): RDD[(Array[Byte], Array[Byte])] = {
+    val path = "/user/jiguanglizipao/terasort-400G"
+    val dataset = sc.newAPIHadoopFile[Array[Byte], Array[Byte], TeraInputFormat](path)
+    dataset.persist(StorageLevel.MEMORY_AND_DISK_SER)
+    dataset.foreach(_ => {})
+    dataset
+  }
 
   def main(args: Array[String]) {
 
@@ -53,24 +63,51 @@ object TeraSortComp {
     // Process command line arguments
     val inputFile = args(0)
     val outputFile = args(1)
+    val numMapper = args(2).toInt
+    val numReducer = args(3).toInt
+    val numIters = if (args.length > 4) args(4).toInt else 1
 
     val conf = new SparkConf()
       .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
       .setAppName(s"TeraSort")
     val sc = new SparkContext(conf)
 
+    val identPartitioner = new Partitioner {
+      override def numPartitions: Int = numMapper
+
+      override def getPartition(key: Any): Int = key.asInstanceOf[Int]
+    }
+
     val t1 = System.nanoTime()
     val dataset = sc.newAPIHadoopFile[Array[Byte], Array[Byte], TeraInputFormat](inputFile)
-    dataset.persist(StorageLevel.MEMORY_AND_DISK)
+      .mapPartitions(it => {
+        val rng = new Random(TaskContext.getPartitionId())
+        it.map(x => ((math.abs(rng.nextLong()) % numMapper).toInt, x))
+      })
+      .partitionBy(identPartitioner)
+      .map { case (_, (k, v)) => (k, v) }
+    dataset.persist(StorageLevel.MEMORY_AND_DISK_SER)
+    dataset.localCheckpoint()
     dataset.foreach(_ => {})
     val t2 = System.nanoTime()
     println(s"Preprocess time: ${1e-9 * (t2 - t1)} sec")
-    val sorted = dataset.repartitionAndSortWithinPartitions(
-      new TeraSortPartitioner(dataset.partitions.length))
-    val count = sorted.count()
-    val t3 = System.nanoTime()
-    println(s"Compute time: ${1e-9 * (t3 - t2)} sec")
-    println(s"Sorted num records: ${count}")
+
+    dataset.cleanShuffleDependencies(true)
+    System.gc()
+    System.runFinalization()
+
+    for (_ <- 0 until numIters) {
+      System.gc()
+      System.runFinalization()
+      val bt = System.nanoTime()
+      val sorted = dataset.repartitionAndSortWithinPartitions(
+        new TeraSortPartitioner(numReducer))
+      val count = sorted.count()
+      val et = System.nanoTime()
+      println(s"Compute time: ${1e-9 * (et - bt)} sec")
+      println(s"Sorted num records: ${count}")
+      sorted.cleanShuffleDependencies(true)
+    }
 
     sc.stop()
   }
