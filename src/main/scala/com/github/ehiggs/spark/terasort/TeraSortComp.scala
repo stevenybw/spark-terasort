@@ -86,7 +86,7 @@ object TeraSortComp {
       })
       .partitionBy(identPartitioner)
       .map { case (_, (k, v)) => (k, v) }
-    dataset.persist(StorageLevel.MEMORY_AND_DISK_SER)
+    dataset.persist(StorageLevel.DISK_ONLY)
     dataset.localCheckpoint()
     dataset.foreach(_ => {})
     val t2 = System.nanoTime()
